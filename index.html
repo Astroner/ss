@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Multiplayer Co-op Game</title>
+    <style>
+        canvas { background: #f0f0f0; display: block; margin: 0 auto; }
+        #main-menu, #lobby, #game-over, #victory { text-align: center; display: none; }
+        #latency, #hp, #wave-number { position: absolute; top: 10px; }
+        #latency { left: 10px; }
+        #hp { right: 10px; }
+        #wave-number { top: 40px; left: 10px; }
+        #disconnect-btn { position: absolute; bottom: 10px; right: 10px; }
+    </style>
+</head>
+<body>
+    <!-- Main Menu -->
+    <div id="main-menu">
+        <h1>Welcome to the Multiplayer Co-op Game</h1>
+        <button id="create-lobby-btn">Create Lobby</button>
+        <div>
+            <input type="text" id="lobby-code-input" placeholder="Enter Lobby Code">
+            <button id="join-lobby-btn">Join Lobby</button>
+        </div>
+    </div>
+
+    <!-- Lobby Screen -->
+    <div id="lobby">
+        <h1>Lobby</h1>
+        <div id="lobby-code-display"></div>
+        <div id="players"></div>
+        <button id="start-btn" style="display: none;">Start Game</button>
+        <button id="exit-btn">Exit Lobby</button>
+    </div>
+
+    <!-- Game Canvas -->
+    <canvas id="gameCanvas" width="800" height="600" style="display: none;"></canvas>
+    <button id="disconnect-btn" style="display: none;">Disconnect</button>
+
+    <!-- Game Over Screen -->
+    <div id="game-over">
+        <h1>Game Over</h1>
+        <button id="menu-btn">Back to Main Menu</button>
+    </div>
+
+    <!-- Victory Screen -->
+    <div id="victory">
+        <h1>Victory!</h1>
+        <button id="back-lobby-btn">Back to Main Menu</button>
+    </div>
+
+    <!-- Latency, HP, and Wave Number Display -->
+    <div id="latency">Latency: -- ms</div>
+    <div id="hp">HP: 100</div>
+    <div id="wave-number">Wave: 1</div>
+
+    <!-- Scripts -->
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+
+        let canvas = document.getElementById('gameCanvas');
+        let ctx = canvas.getContext('2d');
+
+        let mainMenuDiv = document.getElementById('main-menu');
+        let lobbyDiv = document.getElementById('lobby');
+        let gameOverDiv = document.getElementById('game-over');
+        let victoryDiv = document.getElementById('victory');
+        let playersDiv = document.getElementById('players');
+        let startBtn = document.getElementById('start-btn');
+        let exitBtn = document.getElementById('exit-btn');
+        let menuBtn = document.getElementById('menu-btn');
+        let backLobbyBtn = document.getElementById('back-lobby-btn');
+        let latencyDiv = document.getElementById('latency');
+        let hpDiv = document.getElementById('hp');
+        let waveNumberDiv = document.getElementById('wave-number');
+        let createLobbyBtn = document.getElementById('create-lobby-btn');
+        let joinLobbyBtn = document.getElementById('join-lobby-btn');
+        let lobbyCodeInput = document.getElementById('lobby-code-input');
+        let lobbyCodeDisplay = document.getElementById('lobby-code-display');
+        let disconnectBtn = document.getElementById('disconnect-btn');
+
+        let playerId;
+        let players = {};
+        let enemies = [];
+        let bullets = [];
+        let enemyBullets = [];
+        let keys = {};
+        let lastPingTime = Date.now();
+        let latency = 0;
+        let isHost = false;
+        let gameStarted = false;
+        let fps = 60;
+        let lobbyCode = null;
+        let waveNumber = 1;
+        let pingStartTime;
+        let playerDirection = { x: 0, y: -1 }; // Default facing up
+
+        // Event listeners
+        document.addEventListener('keydown', (e) => {
+            keys[e.key.toLowerCase()] = true;
+            if (e.key === ' ') {
+                e.preventDefault();
+                // Use locally calculated direction
+                socket.emit('shoot', { lobbyCode, direction: playerDirection });
+            }
+        });
+        document.addEventListener('keyup', (e) => keys[e.key.toLowerCase()] = false);
+
+        createLobbyBtn.addEventListener('click', () => {
+            socket.emit('createLobby');
+        });
+
+        joinLobbyBtn.addEventListener('click', () => {
+            let code = lobbyCodeInput.value.trim();
+            if (code) {
+                socket.emit('joinLobby', code);
+            }
+        });
+
+        startBtn.addEventListener('click', () => {
+            socket.emit('startGame', lobbyCode);
+        });
+
+        exitBtn.addEventListener('click', () => {
+            socket.emit('exitLobby', lobbyCode);
+            location.reload();
+        });
+
+        menuBtn.addEventListener('click', () => {
+            socket.emit('leaveGame', lobbyCode);
+            gameOverDiv.style.display = 'none';
+            mainMenuDiv.style.display = 'block';
+        });
+
+        backLobbyBtn.addEventListener('click', () => {
+            socket.emit('leaveGame', lobbyCode);
+            victoryDiv.style.display = 'none';
+            mainMenuDiv.style.display = 'block';
+        });
+
+        disconnectBtn.addEventListener('click', () => {
+            socket.emit('leaveGame', lobbyCode);
+            canvas.style.display = 'none';
+            disconnectBtn.style.display = 'none';
+            mainMenuDiv.style.display = 'block';
+        });
+
+        // Socket events
+        socket.on('connect', () => {
+            playerId = socket.id;
+            mainMenuDiv.style.display = 'block';
+        });
+
+        socket.on('lobbyCreated', (code) => {
+            lobbyCode = code;
+            isHost = true;
+            showLobby();
+        });
+
+        socket.on('lobbyJoined', (code) => {
+            lobbyCode = code;
+            isHost = false;
+            showLobby();
+        });
+
+        socket.on('lobbyData', (data) => {
+            playersDiv.innerHTML = `<h3>Players in Lobby:</h3>`;
+            data.players.forEach((p) => {
+                playersDiv.innerHTML += `<p>Player ${p.index}</p>`;
+            });
+            startBtn.style.display = isHost ? 'inline-block' : 'none';
+        });
+
+        socket.on('startGame', () => {
+            lobbyDiv.style.display = 'none';
+            canvas.style.display = 'block';
+            disconnectBtn.style.display = 'block';
+            gameStarted = true;
+            gameLoop();
+        });
+
+        socket.on('updateState', (data) => {
+            players = data.players;
+            enemies = data.enemies;
+            bullets = data.bullets;
+            enemyBullets = data.enemyBullets; // Add this line
+            waveNumber = data.wave;
+            waveNumberDiv.innerText = `Wave: ${waveNumber}`;
+            if (players[playerId]) {
+                hpDiv.innerText = `HP: ${players[playerId].hp}`;
+            }
+        });
+
+        socket.on('gameOver', () => {
+            gameStarted = false;
+            canvas.style.display = 'none';
+            disconnectBtn.style.display = 'none';
+            gameOverDiv.style.display = 'block';
+        });
+
+        socket.on('victory', () => {
+            gameStarted = false;
+            canvas.style.display = 'none';
+            disconnectBtn.style.display = 'none';
+            victoryDiv.style.display = 'block';
+        });
+
+        // Updated latency measurement
+        socket.on('latency', () => {
+            latency = Date.now() - pingStartTime; // Calculate latency
+            latencyDiv.innerText = `Latency: ${latency} ms`;
+        });
+
+        socket.on('error', (message) => {
+            alert(message);
+        });
+
+        function showLobby() {
+            mainMenuDiv.style.display = 'none';
+            lobbyDiv.style.display = 'block';
+            lobbyCodeDisplay.innerHTML = `<h3>Lobby Code: ${lobbyCode}</h3>`;
+        }
+
+        function gameLoop() {
+            let now = Date.now();
+            let delta = now - lastPingTime;
+
+            if (delta >= 1000) {
+                lastPingTime = now;
+                pingStartTime = Date.now(); // Store the current time
+                socket.emit('ping');
+            }
+
+            update();
+            render();
+
+            if (gameStarted) {
+                setTimeout(gameLoop, 1000 / fps);
+            }
+        }
+
+        function update() {
+            let movement = {
+                up: keys['w'] || keys['arrowup'],
+                down: keys['s'] || keys['arrowdown'],
+                left: keys['a'] || keys['arrowleft'],
+                right: keys['d'] || keys['arrowright'],
+            };
+
+            // Calculate player's direction based on keys pressed
+            let dirX = 0;
+            let dirY = 0;
+            if (movement.up) dirY -= 1;
+            if (movement.down) dirY += 1;
+            if (movement.left) dirX -= 1;
+            if (movement.right) dirX += 1;
+            if (dirX !== 0 || dirY !== 0) {
+                let length = Math.hypot(dirX, dirY);
+                playerDirection.x = dirX / length;
+                playerDirection.y = dirY / length;
+            }
+
+            socket.emit('playerMovement', { lobbyCode, movement });
+        }
+
+        function render() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Draw players
+            for (let id in players) {
+                let p = players[id];
+                ctx.fillStyle = 'blue';
+                ctx.fillRect(p.x, p.y, 20, 20);
+                ctx.fillStyle = 'black';
+                ctx.fillText(`P${p.index}`, p.x, p.y - 10);
+            }
+
+            // Draw enemies
+            enemies.forEach((e) => {
+                ctx.fillStyle = e.color;
+                ctx.beginPath();
+                // Different sizes or shapes based on behavior
+                if (e.behavior === 'tank') {
+                    ctx.arc(e.x, e.y, 25, 0, 2 * Math.PI); // Larger for tank enemies
+                } else {
+                    ctx.arc(e.x, e.y, 15, 0, 2 * Math.PI);
+                }
+                ctx.fill();
+            });
+
+            // Draw player bullets
+            bullets.forEach((b) => {
+                ctx.fillStyle = 'black';
+                ctx.fillRect(b.x, b.y, 5, 5);
+            });
+
+            // Draw enemy bullets
+            enemyBullets.forEach((b) => {
+                ctx.fillStyle = 'red'; // Enemy bullets in red
+                ctx.fillRect(b.x, b.y, 5, 5);
+            });
+        }
+    </script>
+</body>
+</html>
