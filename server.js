@@ -32,6 +32,7 @@ io.on('connection', (socket) => {
             enemiesToSpawn: 0,
             spawnInterval: 2000, // Time between enemy spawns (in milliseconds)
             lastSpawnTime: Date.now(),
+            inputs: {}, // Store inputs from clients
         };
         socket.join(lobbyCode);
         lobbies[lobbyCode].players[socket.id] = createNewPlayer(socket.id);
@@ -56,36 +57,13 @@ io.on('connection', (socket) => {
 
     socket.on('playerMovement', (data) => {
         let lobbyCode = data.lobbyCode;
-        let movement = data.movement;
+        let input = data.input;
         let lobby = lobbies[lobbyCode];
         if (lobby && lobby.players[socket.id] && !lobby.players[socket.id].dead) {
-            let player = lobby.players[socket.id];
-            let speed = 5;
-            let moveX = 0;
-            let moveY = 0;
-            if (movement.up) moveY -= 1;
-            if (movement.down) moveY += 1;
-            if (movement.left) moveX -= 1;
-            if (movement.right) moveX += 1;
-
-            // Normalize movement vector
-            let length = Math.hypot(moveX, moveY);
-            if (length > 0) {
-                moveX = (moveX / length) * speed;
-                moveY = (moveY / length) * speed;
-                player.x += moveX;
-                player.y += moveY;
+            if (!lobby.inputs[socket.id]) {
+                lobby.inputs[socket.id] = [];
             }
-
-            // Ensure player stays within the game boundaries
-            player.x = Math.max(0, Math.min(player.x, 780)); // Assuming player width is 20
-            player.y = Math.max(0, Math.min(player.y, 580)); // Assuming player height is 20
-
-            // Update player direction
-            if (moveX !== 0 || moveY !== 0) {
-                player.direction.x = moveX;
-                player.direction.y = moveY;
-            }
+            lobby.inputs[socket.id].push(input);
         }
     });
 
@@ -145,12 +123,13 @@ io.on('connection', (socket) => {
 
 function createNewPlayer(id) {
     return {
-        x: Math.random() * 780,
-        y: Math.random() * 580,
+        x: 400, // Center of the canvas (800 / 2)
+        y: 300, // Center of the canvas (600 / 2)
         hp: 100,
         index: 1,
         direction: { x: 0, y: -1 },
         dead: false,
+        lastProcessedInput: 0,
     };
 }
 
@@ -218,6 +197,7 @@ function startGame(lobbyCode) {
     if (lobby) {
         lobby.isGameRunning = true;
         lobby.wave = 1;
+        resetPlayerPositions(lobby); // Reset player positions at the start
         setupWave(lobbyCode);
         lobby.gameInterval = setInterval(() => gameLoop(lobbyCode), 1000 / 60);
         io.to(lobbyCode).emit('startGame');
@@ -230,11 +210,34 @@ function setupWave(lobbyCode) {
     lobby.enemyBullets = [];
     lobby.enemiesToSpawn = lobby.wave * 10; // Increase number of enemies per wave
     lobby.lastSpawnTime = Date.now();
+    resetPlayerPositions(lobby); // Reset player positions at the start of each wave
+}
+
+function resetPlayerPositions(lobby) {
+    for (let id in lobby.players) {
+        lobby.players[id].x = 400; // Center of the canvas
+        lobby.players[id].y = 300;
+        lobby.players[id].dead = false;
+        lobby.players[id].hp = 100;
+        lobby.players[id].lastProcessedInput = 0;
+        lobby.inputs[id] = [];
+    }
 }
 
 function gameLoop(lobbyCode) {
     let lobby = lobbies[lobbyCode];
     if (!lobby) return;
+
+    // Process player inputs
+    for (let id in lobby.players) {
+        let player = lobby.players[id];
+        let inputs = lobby.inputs[id] || [];
+        for (let input of inputs) {
+            applyInput(player, input);
+            player.lastProcessedInput = input.seq;
+        }
+        lobby.inputs[id] = []; // Clear processed inputs
+    }
 
     // Spawn enemies over time
     spawnEnemiesOverTime(lobby);
@@ -250,7 +253,40 @@ function gameLoop(lobbyCode) {
         bullets: lobby.bullets,
         enemyBullets: lobby.enemyBullets || [],
         wave: lobby.wave,
+        lastProcessedInput: getLastProcessedInput(lobby, lobby.players),
     });
+}
+
+function getLastProcessedInput(lobby, players) {
+    let minSeq = Infinity;
+    for (let id in players) {
+        minSeq = Math.min(minSeq, players[id].lastProcessedInput);
+    }
+    return minSeq;
+}
+
+function applyInput(player, input) {
+    let movement = input.movement;
+    let speed = 5;
+    let moveX = 0;
+    let moveY = 0;
+    if (movement.up) moveY -= 1;
+    if (movement.down) moveY += 1;
+    if (movement.left) moveX -= 1;
+    if (movement.right) moveX += 1;
+
+    // Normalize movement vector
+    let length = Math.hypot(moveX, moveY);
+    if (length > 0) {
+        moveX = (moveX / length) * speed;
+        moveY = (moveY / length) * speed;
+        player.x += moveX;
+        player.y += moveY;
+    }
+
+    // Ensure player stays within the game boundaries
+    player.x = Math.max(0, Math.min(player.x, 780)); // Assuming player width is 20
+    player.y = Math.max(0, Math.min(player.y, 580)); // Assuming player height is 20
 }
 
 function spawnEnemiesOverTime(lobby) {
@@ -343,11 +379,6 @@ function updateBullets(lobbyCode) {
     if (lobby.enemies.length === 0 && lobby.enemiesToSpawn === 0 && lobby.wave < lobby.maxWaves) {
         lobby.wave++;
         setupWave(lobbyCode);
-        // Revive dead players
-        for (let id in lobby.players) {
-            lobby.players[id].dead = false;
-            lobby.players[id].hp = 100;
-        }
     } else if (lobby.enemies.length === 0 && lobby.enemiesToSpawn === 0 && lobby.wave >= lobby.maxWaves) {
         endGame(lobbyCode, 'victory');
     }
@@ -504,9 +535,10 @@ function resetGame(lobbyCode) {
     let lobby = lobbies[lobbyCode];
     for (let id in lobby.players) {
         lobby.players[id].hp = 100;
-        lobby.players[id].x = Math.random() * 780;
-        lobby.players[id].y = Math.random() * 580;
+        lobby.players[id].x = 400; // Center of the canvas
+        lobby.players[id].y = 300;
         lobby.players[id].dead = false;
+        lobby.players[id].lastProcessedInput = 0;
     }
     lobby.enemies = [];
     lobby.bullets = [];
@@ -514,6 +546,7 @@ function resetGame(lobbyCode) {
     lobby.wave = 1;
     lobby.enemiesToSpawn = 0;
     lobby.lastSpawnTime = Date.now();
+    lobby.inputs = {};
 }
 
 function generateLobbyCode() {

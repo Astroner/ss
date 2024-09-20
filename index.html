@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Multiplayer Co-op Game</title>
+    <title>Multiplayer Co-op Game with Latency Compensation</title>
     <style>
         canvas { background: #f0f0f0; display: block; margin: 0 auto; }
         #main-menu, #lobby, #game-over, #victory { text-align: center; display: none; }
@@ -96,6 +96,19 @@
         let pingStartTime;
         let playerDirection = { x: 0, y: -1 }; // Default facing up
 
+        // Client-side prediction variables
+        let myPlayer = {
+            x: 400,
+            y: 300,
+            hp: 100,
+            direction: { x: 0, y: -1 },
+            dead: false,
+        };
+        let serverSnapshots = [];
+        let lastProcessedInput = 0;
+        let inputSequenceNumber = 0;
+        let pendingInputs = [];
+
         // Event listeners
         document.addEventListener('keydown', (e) => {
             keys[e.key.toLowerCase()] = true;
@@ -181,15 +194,7 @@
         });
 
         socket.on('updateState', (data) => {
-            players = data.players;
-            enemies = data.enemies;
-            bullets = data.bullets;
-            enemyBullets = data.enemyBullets; // Add this line
-            waveNumber = data.wave;
-            waveNumberDiv.innerText = `Wave: ${waveNumber}`;
-            if (players[playerId]) {
-                hpDiv.innerText = `HP: ${players[playerId].hp}`;
-            }
+            processServerUpdate(data);
         });
 
         socket.on('gameOver', () => {
@@ -236,7 +241,7 @@
             render();
 
             if (gameStarted) {
-                setTimeout(gameLoop, 1000 / fps);
+                requestAnimationFrame(gameLoop);
             }
         }
 
@@ -261,33 +266,108 @@
                 playerDirection.y = dirY / length;
             }
 
-            socket.emit('playerMovement', { lobbyCode, movement });
+            // Client-side prediction for movement
+            let input = {
+                seq: inputSequenceNumber++,
+                movement: movement,
+            };
+            applyInput(myPlayer, input);
+            pendingInputs.push(input);
+
+            socket.emit('playerMovement', { lobbyCode, input });
+        }
+
+        function applyInput(player, input) {
+            let speed = 5;
+            let moveX = 0;
+            let moveY = 0;
+            if (input.movement.up) moveY -= 1;
+            if (input.movement.down) moveY += 1;
+            if (input.movement.left) moveX -= 1;
+            if (input.movement.right) moveX += 1;
+
+            // Normalize movement vector
+            let length = Math.hypot(moveX, moveY);
+            if (length > 0) {
+                moveX = (moveX / length) * speed;
+                moveY = (moveY / length) * speed;
+                player.x += moveX;
+                player.y += moveY;
+            }
+
+            // Ensure player stays within the game boundaries
+            player.x = Math.max(0, Math.min(player.x, 780)); // Assuming player width is 20
+            player.y = Math.max(0, Math.min(player.y, 580)); // Assuming player height is 20
+        }
+
+        function processServerUpdate(data) {
+            waveNumber = data.wave;
+            waveNumberDiv.innerText = `Wave: ${waveNumber}`;
+
+            // Find the server's authoritative position of our player
+            let serverPlayer = data.players[playerId];
+            if (serverPlayer) {
+                myPlayer.hp = serverPlayer.hp;
+                hpDiv.innerText = `HP: ${myPlayer.hp}`;
+
+                // Reconcile the client's predicted position with the server's authoritative position
+                myPlayer.x = serverPlayer.x;
+                myPlayer.y = serverPlayer.y;
+
+                // Remove processed inputs
+                let i = 0;
+                while (i < pendingInputs.length) {
+                    if (pendingInputs[i].seq <= data.lastProcessedInput) {
+                        pendingInputs.splice(i, 1);
+                    } else {
+                        i++;
+                    }
+                }
+
+                // Re-apply pending inputs
+                for (let input of pendingInputs) {
+                    applyInput(myPlayer, input);
+                }
+            }
+
+            // Update other players and entities
+            players = data.players;
+            enemies = data.enemies;
+            bullets = data.bullets;
+            enemyBullets = data.enemyBullets || [];
         }
 
         function render() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-            // Draw players
-            for (let id in players) {
-                let p = players[id];
-                ctx.fillStyle = 'blue';
-                ctx.fillRect(p.x, p.y, 20, 20);
-                ctx.fillStyle = 'black';
-                ctx.fillText(`P${p.index}`, p.x, p.y - 10);
-            }
-
-            // Draw enemies
+            // Draw enemies with interpolation
             enemies.forEach((e) => {
                 ctx.fillStyle = e.color;
                 ctx.beginPath();
-                // Different sizes or shapes based on behavior
                 if (e.behavior === 'tank') {
-                    ctx.arc(e.x, e.y, 25, 0, 2 * Math.PI); // Larger for tank enemies
+                    ctx.arc(e.x, e.y, 25, 0, 2 * Math.PI);
                 } else {
                     ctx.arc(e.x, e.y, 15, 0, 2 * Math.PI);
                 }
                 ctx.fill();
             });
+
+            // Draw other players
+            for (let id in players) {
+                if (id !== playerId) {
+                    let p = players[id];
+                    ctx.fillStyle = 'blue';
+                    ctx.fillRect(p.x, p.y, 20, 20);
+                    ctx.fillStyle = 'black';
+                    ctx.fillText(`P${p.index}`, p.x, p.y - 10);
+                }
+            }
+
+            // Draw our player
+            ctx.fillStyle = 'green';
+            ctx.fillRect(myPlayer.x, myPlayer.y, 20, 20);
+            ctx.fillStyle = 'black';
+            ctx.fillText(`You`, myPlayer.x, myPlayer.y - 10);
 
             // Draw player bullets
             bullets.forEach((b) => {
@@ -297,7 +377,7 @@
 
             // Draw enemy bullets
             enemyBullets.forEach((b) => {
-                ctx.fillStyle = 'red'; // Enemy bullets in red
+                ctx.fillStyle = 'red';
                 ctx.fillRect(b.x, b.y, 5, 5);
             });
         }
